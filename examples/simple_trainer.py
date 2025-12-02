@@ -15,6 +15,9 @@ import tqdm
 import tyro
 import viser
 import yaml
+
+import sys
+sys.path.append("./examples")
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
@@ -31,7 +34,6 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
-from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
@@ -44,10 +46,8 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 class Config:
     # Disable viewer
     disable_viewer: bool = False
-    # Path to the .pt files. If provide, it will skip training and run evaluation only.
+    # Path to the .pt files. If provided, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
-    # Name of compression strategy to use
-    compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
 
@@ -57,7 +57,7 @@ class Config:
     data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/garden"
-    # Every N images there is a test image
+    # Every N images there is a test image, the rest are for training
     test_every: int = 8
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
@@ -77,7 +77,8 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    # max_steps: int = 30_000
+    max_steps: int = 6_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
@@ -127,6 +128,7 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
+    # Learning rates for different parameters of the Gaussians
     # LR for 3D point positions
     means_lr: float = 1.6e-4
     # LR for Gaussian scale factors
@@ -178,6 +180,7 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # The network used for LPIPS calculation
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # 3DGUT (uncented transform + eval 3D)
@@ -194,6 +197,7 @@ class Config:
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
+        # Strategy for densification
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
@@ -232,27 +236,35 @@ def create_splats_with_optimizers(
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
+        # Get the points from COLMAP
         points = torch.from_numpy(parser.points).float()
+        # Get the colors from COLMAP
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
+        # Randomly initialize points and colors
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
+    # Compute the average distance to the 4 nearest neighbors (including itself)
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
+    # The scales of the Gaussians are determined this way
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    points   = points[world_rank::world_size]
+    rgbs     = rgbs[world_rank::world_size]
+    scales   = scales[world_rank::world_size]
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    # Number of Gaussians
+    N        = points.shape[0]
+    # Quaternions for orientations
+    quats    = torch.rand((N, 4))  # [N, 4]
+    # Initial opacities
+    opacities= torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
@@ -275,6 +287,7 @@ def create_splats_with_optimizers(
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
+    # All the parameters
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
@@ -331,7 +344,7 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # Load data: Training data should contain initial points and colors.
+        # Load data: Training data should contain initial points and colors (for example from ColMAP)
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
@@ -346,10 +359,12 @@ class Runner:
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
+        print("--- Scene scale:", self.scene_scale)
 
         # Model
+        # Decide here what we use for color representation
         feature_dim = 32 if cfg.app_opt else None
+        # Create the Gaussian representations and the optimizers
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -373,7 +388,7 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
         )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        print("--- Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -386,73 +401,6 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
-
-        # Compression Strategy
-        self.compression_method = None
-        if cfg.compression is not None:
-            if cfg.compression == "png":
-                self.compression_method = PngCompression()
-            else:
-                raise ValueError(f"Unknown compression strategy: {cfg.compression}")
-
-        self.pose_optimizers = []
-        if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_adjust.zero_init()
-            self.pose_optimizers = [
-                torch.optim.Adam(
-                    self.pose_adjust.parameters(),
-                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
-                    weight_decay=cfg.pose_opt_reg,
-                )
-            ]
-            if world_size > 1:
-                self.pose_adjust = DDP(self.pose_adjust)
-
-        if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_perturb.random_init(cfg.pose_noise)
-            if world_size > 1:
-                self.pose_perturb = DDP(self.pose_perturb)
-
-        self.app_optimizers = []
-        if cfg.app_opt:
-            assert feature_dim is not None
-            self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
-            ).to(self.device)
-            # initialize the last layer to be zero so that the initial output is zero.
-            torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
-            torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
-            self.app_optimizers = [
-                torch.optim.Adam(
-                    self.app_module.embeds.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
-                    weight_decay=cfg.app_opt_reg,
-                ),
-                torch.optim.Adam(
-                    self.app_module.color_head.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
-                ),
-            ]
-            if world_size > 1:
-                self.app_module = DDP(self.app_module)
-
-        self.bil_grid_optimizers = []
-        if cfg.use_bilateral_grid:
-            self.bil_grids = BilateralGrid(
-                len(self.trainset),
-                grid_X=cfg.bilateral_grid_shape[0],
-                grid_Y=cfg.bilateral_grid_shape[1],
-                grid_W=cfg.bilateral_grid_shape[2],
-            ).to(self.device)
-            self.bil_grid_optimizers = [
-                torch.optim.Adam(
-                    self.bil_grids.parameters(),
-                    lr=2e-3 * math.sqrt(cfg.batch_size),
-                    eps=1e-15,
-                ),
-            ]
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -847,15 +795,6 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -885,10 +824,6 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
                 self.render_traj(step)
-
-            # run compression
-            if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
-                self.run_compression(step=step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -1069,23 +1004,6 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
-    def run_compression(self, step: int):
-        """Entry for running compression."""
-        print("Running compression...")
-        world_rank = self.world_rank
-
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
-        os.makedirs(compress_dir, exist_ok=True)
-
-        self.compression_method.compress(compress_dir, self.splats)
-
-        # evaluate compression
-        splats_c = self.compression_method.decompress(compress_dir)
-        for k in splats_c.keys():
-            self.splats[k].data = splats_c[k].to(self.device)
-        self.eval(step=step, stage="compress")
-
-    @torch.no_grad()
     def _viewer_render_fn(
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
@@ -1178,8 +1096,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
-        if cfg.compression is not None:
-            runner.run_compression(step=step)
     else:
         runner.train()
 
@@ -1243,19 +1159,6 @@ if __name__ == "__main__":
                 slice,
                 total_variation_loss,
             )
-
-    # try import extra dependencies
-    if cfg.compression == "png":
-        try:
-            import plas
-            import torchpq
-        except:
-            raise ImportError(
-                "To use PNG compression, you need to install "
-                "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
-                "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
-            )
-
     if cfg.with_ut:
         assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
 
