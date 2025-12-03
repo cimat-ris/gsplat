@@ -104,7 +104,7 @@ def _compute_view_dirs_packed(
 
     return dirs
 
-
+# Main rasterization function
 def rasterization(
     means: Tensor,  # [..., N, 3]
     quats: Tensor,  # [..., N, 4]
