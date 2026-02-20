@@ -33,7 +33,6 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.distributed import cli
-from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.rendering import _rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
@@ -49,17 +48,23 @@ class Config:
     ckpt: Optional[List[str]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
-
+    # Name of the sub-directory with the dataset
     subdir = "garden"
     subdir = "kitchen"
+    subdir = "bonsai"
+    subdir = "stump"
+    subdir = "alameda"
+    subdir = "london"
+
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/"+subdir
+    #data_dir: str = "data/360_v2/"+subdir
+    data_dir: str = "datasets/data/zipnerf_undistorted/"+subdir
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/"+subdir
     # Every N images there is a test image, the rest are for training
-    test_every: int = 8
+    test_every: int = 8 
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -100,7 +105,7 @@ class Config:
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
-    init_opa: float = 0.1
+    init_opacity: float = 0.1
     # Initial scale of GS
     init_scale: float = 1.0
     # Weight for SSIM loss
@@ -269,7 +274,7 @@ class Runner:
     ) -> None:
         set_random_seed(42 + local_rank)
 
-        self.cfg = cfg
+        self.cfg        = cfg
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -298,13 +303,18 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+        # Training data
         self.trainset = Dataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=False,
         )
-        self.valset = Dataset(self.parser, split="val")
+        # Validation data
+        self.valset = Dataset(
+            self.parser, 
+            split="val"
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("--- Scene scale:", self.scene_scale)
 
@@ -317,7 +327,7 @@ class Runner:
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
+            init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
@@ -372,7 +382,7 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
-
+    # Method for rasterization, used in both training and evaluation
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -384,22 +394,21 @@ class Runner:
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
-        image_ids = kwargs.pop("image_ids", None)
-        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        # The Gaussian parameters
+        means    = self.splats["means"]  # [N, 3]
+        quats    = self.splats["quats"]  # [N, 4]
+        scales   = torch.exp(self.splats["scales"])  # [N, 3]
+        opacities= torch.sigmoid(self.splats["opacities"])  # [N,]
+        colors   = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        # Remove image_ids from kwargs
+        kwargs.pop("image_ids", None)
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        if False:
-            render_colors, render_alphas, info = rasterization(
+        # Function to rasterize the Gaussians, which is differentiable and runs on GPU. It returns the rendered colors, alphas, and other info such as the number of GSs that contribute to each pixel.
+        render_colors, render_alphas, info = rasterization(
                 means=means,
                 quats=quats,
                 scales=scales,
@@ -418,32 +427,16 @@ class Runner:
                 rasterize_mode=rasterize_mode,
                 distributed=self.world_size > 1,
                 camera_model=self.cfg.camera_model,
-                **kwargs,
-            )
-        else:
-            render_colors, render_alphas, info = _rasterization(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-                Ks=Ks,  # [C, 3, 3]
-                width=width,
-                height=height,
-                rasterize_mode=rasterize_mode,
-                **kwargs,
-            )
-
+                **kwargs)
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
+    # Main training loop
     def train(self):
-        cfg = self.cfg
-        device = self.device
+        cfg        = self.cfg
+        device     = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         # Dump cfg.
         if world_rank == 0:
@@ -472,7 +465,7 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
+        pbar       = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -488,7 +481,7 @@ class Runner:
                 data = next(trainloader_iter)
 
             # Position of the camera
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            camtoworlds = data["camtoworld"].to(device)  # [1, 4, 4]
             # Intrinsics of the camera
             Ks          = data["K"].to(device)  # [1, 3, 3]
             # The image
@@ -497,14 +490,14 @@ class Runner:
             num_train_rays_per_step = (
                 gt_colors.shape[0] * gt_colors.shape[1] * gt_colors.shape[2]
             )
-            image_ids = data["image_id"].to(device)
-            masks     = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            image_ids     = data["image_id"].to(device)
+            masks         = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             height, width = gt_colors.shape[1:3]
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward pass: renders the Gaussians
-            renders, alphas, info = self.rasterize_splats(
+            renders, __, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -516,11 +509,7 @@ class Runner:
                 render_mode="RGB",
                 masks=masks,
             )
-            if renders.shape[-1] == 4:
-                rendered_colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                rendered_colors, depths = renders, None
-
+            rendered_colors = renders[..., 0:3]
             # Prepare for backward
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -536,7 +525,7 @@ class Runner:
             ssimloss = 1.0 - fused_ssim(
                 rendered_colors.permute(0, 3, 1, 2), gt_colors.permute(0, 3, 1, 2), padding="valid"
             )
-            # Linear combination of the two losses
+            # Total loss is a linear combination of the two losses
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             loss.backward()
 
@@ -573,6 +562,10 @@ class Runner:
                 data = {"step": step, "splats": self.splats.state_dict()}
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                )
+
+                # save ply
+                export_splats(self.splats["means"],self.splats["scales"],self.splats["quats"],self.splats["opacities"],self.splats["sh0"],self.splats["shN"],format="ply",save_to=f"{self.ply_dir}/splats_step{step}_rank{self.world_rank}.ply"
                 )
             
             # optimize
@@ -629,7 +622,6 @@ class Runner:
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
@@ -901,7 +893,7 @@ if __name__ == "__main__":
         "mcmc": (
             "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
-                init_opa=0.5,
+                init_opacity=0.5,
                 init_scale=0.1,
                 strategy=MCMCStrategy(verbose=True),
             ),
