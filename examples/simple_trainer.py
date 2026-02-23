@@ -34,7 +34,7 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 from gsplat import export_splats
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
-from gsplat.rendering import _rasterization
+#from gsplat.rendering import _rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -60,7 +60,8 @@ class Config:
     #data_dir: str = "data/360_v2/"+subdir
     data_dir: str = "datasets/data/zipnerf_undistorted/"+subdir
     # Downsample factor for the dataset
-    data_factor: int = 4
+    #data_factor: int = 4
+    data_factor: int = 8
     # Directory to save results
     result_dir: str = "results/"+subdir
     # Every N images there is a test image, the rest are for training
@@ -146,9 +147,6 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
-    # The network used for LPIPS calculation
-    lpips_net: Literal["vgg", "alex"] = "alex"
-
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         print(f"--- Adjusted eval_steps: {self.eval_steps}")
@@ -159,18 +157,10 @@ class Config:
 
         # Strategy for densification
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
-            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-            strategy.reset_every = int(strategy.reset_every * factor)
-            strategy.refine_every = int(strategy.refine_every * factor)
-        elif isinstance(strategy, MCMCStrategy):
-            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-            strategy.refine_every = int(strategy.refine_every * factor)
-        else:
-            assert_never(strategy)
-
+        strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+        strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+        strategy.reset_every = int(strategy.reset_every * factor)
+        strategy.refine_every = int(strategy.refine_every * factor)
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -273,12 +263,11 @@ class Runner:
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
-
         self.cfg        = cfg
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
-        self.device = f"cuda:{local_rank}"
+        self.device     = f"cuda:{local_rank}"
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -296,14 +285,15 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # Load data: Training data should contain initial points and colors (for example from ColMAP)
+        # Load data: Training data should contain initial points and colors 
+        # (for example from ColMAP)
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
-        # Training data
+        # Training data organised into a dataset
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -343,35 +333,16 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
         )
-        print("--- Model initialized. Number of GS:", len(self.splats["means"]))
+        print("--- Model initialized from {}. Number of GS: {}".format(self.cfg.init_type, len(self.splats["means"])))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
-
-        if isinstance(self.cfg.strategy, DefaultStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale
-            )
-        elif isinstance(self.cfg.strategy, MCMCStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state()
-        else:
-            assert_never(self.cfg.strategy)
+        self.strategy_state = self.cfg.strategy.initialize_state(scene_scale=self.scene_scale)
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
-
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True).to(self.device)
 
         # Viewer
         if not self.cfg.disable_viewer:
@@ -408,26 +379,45 @@ class Runner:
         if camera_model is None:
             camera_model = self.cfg.camera_model
         # Function to rasterize the Gaussians, which is differentiable and runs on GPU. It returns the rendered colors, alphas, and other info such as the number of GSs that contribute to each pixel.
-        render_colors, render_alphas, info = rasterization(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-                Ks=Ks,  # [C, 3, 3]
-                width=width,
-                height=height,
-                packed=self.cfg.packed,
-                absgrad=(
-                    self.cfg.strategy.absgrad
-                    if isinstance(self.cfg.strategy, DefaultStrategy)
-                    else False
-                ),
-                rasterize_mode=rasterize_mode,
-                distributed=self.world_size > 1,
-                camera_model=self.cfg.camera_model,
-                **kwargs)
+        kwargs.pop("radius_clip", None) # For _rasterization
+        if False:
+            render_colors, render_alphas, info = _rasterization(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                    Ks=Ks,  # [C, 3, 3]
+                    width=width,
+                    height=height,
+                    #packed=self.cfg.packed,
+                    #absgrad=(
+                    #    self.cfg.strategy.absgrad
+                    #    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    #    else False
+                    #),
+                    rasterize_mode=rasterize_mode,
+                    #distributed=self.world_size > 1,
+                    #camera_model=self.cfg.camera_model,
+                    **kwargs)
+        else:
+            render_colors, render_alphas, info = rasterization(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                    Ks=Ks,  # [C, 3, 3]
+                    width=width,
+                    height=height,
+                    packed=self.cfg.packed,
+                    absgrad=self.cfg.strategy.absgrad,
+                    rasterize_mode=rasterize_mode,
+                    distributed=self.world_size > 1,
+                    camera_model=self.cfg.camera_model,
+                    **kwargs)
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -568,7 +558,7 @@ class Runner:
                 export_splats(self.splats["means"],self.splats["scales"],self.splats["quats"],self.splats["opacities"],self.splats["sh0"],self.splats["shN"],format="ply",save_to=f"{self.ply_dir}/splats_step{step}_rank{self.world_rank}.ply"
                 )
             
-            # optimize
+            # Optimize
             for optimizer in self.optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -576,8 +566,7 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
+            self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
@@ -585,17 +574,6 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -874,32 +852,12 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
+    CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
     """
-
-    # Config objects we can choose between.
-    # Each is a tuple of (CLI description, config object).
-    configs = {
-        "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
-            Config(
-                strategy=DefaultStrategy(verbose=True),
-            ),
-        ),
-        "mcmc": (
-            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
-            Config(
-                init_opacity=0.5,
-                init_scale=0.1,
-                strategy=MCMCStrategy(verbose=True),
-            ),
-        ),
-    }
-    cfg = tyro.extras.overridable_config_cli(configs)
+    cfg = Config(strategy=DefaultStrategy(verbose=True))
     cfg.adjust_steps(cfg.steps_scaler)
-
     cli(main, cfg, verbose=True)
