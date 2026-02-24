@@ -6,13 +6,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-
+import tyro
 import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
-import tyro
 import viser
 import yaml
 
@@ -28,13 +27,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from typing_extensions import Literal
+from utils import knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
 from gsplat.distributed import cli
-from gsplat.rendering import rasterization
-#from gsplat.rendering import _rasterization
+from gsplat.rendering import rasterization, _rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -55,10 +53,11 @@ class Config:
     subdir = "stump"
     subdir = "alameda"
     subdir = "london"
-
+    subdir = "london"
+    subdir = "bicycle"
     # Path to the Mip-NeRF 360 dataset
-    #data_dir: str = "data/360_v2/"+subdir
-    data_dir: str = "datasets/data/zipnerf_undistorted/"+subdir
+    data_dir: str = "data/360_v2/"+subdir
+    #data_dir: str = "datasets/data/zipnerf_undistorted/"+subdir
     # Downsample factor for the dataset
     #data_factor: int = 4
     data_factor: int = 8
@@ -74,6 +73,8 @@ class Config:
     normalize_world_space: bool = True
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    # Rasterization technique to use
+    rasterization_technique: Literal["CUDA", "GSPLAT", "OURS"] = "CUDA"
 
     # Port for the viewer server
     port: int = 8080
@@ -102,6 +103,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
+    #sh_degree: int = 3
     sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
@@ -125,9 +127,6 @@ class Config:
     packed: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
-    # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
-
     # Learning rates for different parameters of the Gaussians
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -178,7 +177,6 @@ def create_splats_with_optimizers(
     scene_scale: float = 1.0,
     sh_degree: int = 3,
     batch_size: int = 1,
-    feature_dim: Optional[int] = None,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -222,19 +220,12 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
-
+    # color is SH coefficients.
+    colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+    colors[:, 0, :] = rgb_to_sh(rgbs)
+    params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+    params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+    
     # All the parameters
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -309,8 +300,6 @@ class Runner:
         print("--- Scene scale:", self.scene_scale)
 
         # Model
-        # Decide here what we use for color representation
-        feature_dim = None
         # Create the Gaussian representations and the optimizers
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
@@ -328,13 +317,12 @@ class Runner:
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
         )
         print("--- Model initialized from {}. Number of GS: {}".format(self.cfg.init_type, len(self.splats["means"])))
-
+        print("--- Rasterization technique: {}".format(self.cfg.rasterization_technique))
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.cfg.strategy.initialize_state(scene_scale=self.scene_scale)
@@ -361,8 +349,8 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
-        rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        rasterization_technique: Optional[Literal["CUDA", "GSPLAT", "OURS"]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         # The Gaussian parameters
@@ -373,14 +361,12 @@ class Runner:
         colors   = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
         # Remove image_ids from kwargs
         kwargs.pop("image_ids", None)
-
-        if rasterize_mode is None:
-            rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        rasterize_mode = "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
         # Function to rasterize the Gaussians, which is differentiable and runs on GPU. It returns the rendered colors, alphas, and other info such as the number of GSs that contribute to each pixel.
         kwargs.pop("radius_clip", None) # For _rasterization
-        if False:
+        if rasterization_technique=="GSPLAT":
             render_colors, render_alphas, info = _rasterization(
                     means=means,
                     quats=quats,
@@ -414,7 +400,6 @@ class Runner:
                     height=height,
                     packed=self.cfg.packed,
                     absgrad=self.cfg.strategy.absgrad,
-                    rasterize_mode=rasterize_mode,
                     distributed=self.world_size > 1,
                     camera_model=self.cfg.camera_model,
                     **kwargs)
@@ -497,6 +482,7 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB",
+                rasterization_technique=cfg.rasterization_technique,
                 masks=masks,
             )
             rendered_colors = renders[..., 0:3]
@@ -623,6 +609,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                rasterization_technique=cfg.rasterization_technique,
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
@@ -729,6 +716,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                rasterization_technique=cfg.rasterization_technique,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -858,6 +846,7 @@ if __name__ == "__main__":
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
     """
-    cfg = Config(strategy=DefaultStrategy(verbose=True))
+    cfg = tyro.cli(Config)
+    cfg.strategy=DefaultStrategy(verbose=True)
     cfg.adjust_steps(cfg.steps_scaler)
     cli(main, cfg, verbose=True)
