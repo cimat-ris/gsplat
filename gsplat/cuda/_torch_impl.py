@@ -502,7 +502,6 @@ def _isect_offset_encode(
     offsets = cum_tile_counts - tile_counts
     return offsets.int()
 
-
 def accumulate(
     means2d: Tensor,  # [..., N, 2]
     conics: Tensor,  # [..., N, 3]
@@ -567,27 +566,159 @@ def accumulate(
     assert opacities.shape == image_dims + (N,), opacities.shape
     assert colors.shape == image_dims + (N, channels), colors.shape
 
-    means2d = means2d.reshape(I, N, 2)
-    conics = conics.reshape(I, N, 3)
+    # 2d means and 2d covariances ("conics")
+    means2d   = means2d.reshape(I, N, 2)
+    conics    = conics.reshape(I, N, 3)
+    # Opacities
     opacities = opacities.reshape(I, N)
-    colors = colors.reshape(I, N, channels)
+    colors    = colors.reshape(I, N, channels)
 
-    pixel_ids_x = pixel_ids % image_width
-    pixel_ids_y = pixel_ids // image_width
+    # From pixel_ids, deduce the pixel coordinates (in the image plane). Note that pixel_ids is a flattened list of shape [M], where M is the total number of intersections between pixels and Gaussians. Each pixel_id corresponds to a pixel in the image, and we can compute its 2D coordinates (x, y) using the image width and height.
+    pixel_ids_x  = pixel_ids % image_width
+    pixel_ids_y  = pixel_ids // image_width
     pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2]
+
+    # Relative position of the pixel center to the Gaussian mean, which is used to compute the alpha and weights for the alpha compositing.
     deltas = pixel_coords - means2d[image_ids, gaussian_ids]  # [M, 2]
-    c = conics[image_ids, gaussian_ids]  # [M, 3]
+    # For each intersection, get the covariance
+    c      = conics[image_ids, gaussian_ids]  # [M, 3]
+    # Deduce the sigmas for the alpha compositing from the conics and deltas. The formula is derived from the Gaussian function, where the exponent is -0.5 * (x-mu)^T * Sigma^-1 * (x-mu). Here we only need the exponent part, which is -0.5 * (delta^T * conic * delta). The conic is the upper triangle of the inverse covariance matrix, which can be represented as [[c0, c1], [c1, c2]].
     sigmas = (
         0.5 * (c[:, 0] * deltas[:, 0] ** 2 + c[:, 2] * deltas[:, 1] ** 2)
         + c[:, 1] * deltas[:, 0] * deltas[:, 1]
     )  # [M]
+    # Clamping the opacities to prevent numerical issues in the alpha compositing. The maximum opacity is set to 0.999, which means each Gaussian can contribute at most 99.9% opacity to a pixel. This is to prevent the accumulated opacity from reaching 1.0, which would cause numerical instability in the alpha compositing.
     alphas = torch.clamp_max(
         opacities[image_ids, gaussian_ids] * torch.exp(-sigmas), 0.999
     )
-
     indices = image_ids * image_height * image_width + pixel_ids
     total_pixels = I * image_height * image_width
+    weights, trans = render_weight_from_alpha(
+        alphas, ray_indices=indices, n_rays=total_pixels
+    )
+    renders = accumulate_along_rays(
+        weights,
+        colors[image_ids, gaussian_ids],
+        ray_indices=indices,
+        n_rays=total_pixels,
+    ).reshape(image_dims + (image_height, image_width, channels))
+    alphas = accumulate_along_rays(
+        weights, None, ray_indices=indices, n_rays=total_pixels
+    ).reshape(image_dims + (image_height, image_width, 1))
 
+    return renders, alphas
+
+
+def accumulate_int(
+    means2d: Tensor,  # [..., N, 2]
+    means3d: Tensor,  # [..., N, 3]
+    precisions: Tensor,  # [..., N, 3, 3]
+    conics: Tensor,  # [..., N, 3]
+    Kinv: Tensor, # [3, 3]
+    opacities: Tensor,  # [..., N]
+    colors: Tensor,  # [..., N, channels]
+    gaussian_ids: Tensor,  # [M]
+    pixel_ids: Tensor,  # [M]
+    image_ids: Tensor,  # [M]
+    image_width: int,
+    image_height: int,
+) -> Tuple[Tensor, Tensor]:
+    """Alpah compositing of 2D Gaussians in Pure Pytorch.
+
+    This function performs alpha compositing for Gaussians based on the pair of indices
+    {gaussian_ids, pixel_ids, image_ids}, which annotates the intersection between all
+    pixels and Gaussians. These intersections can be accquired from
+    `gsplat.rasterize_to_indices_in_range`.
+
+    .. note::
+
+        This function exposes the alpha compositing process into pure Pytorch.
+        So it relies on Pytorch's autograd for the backpropagation. It is much slower
+        than our fully fused rasterization implementation and comsumes much more GPU memory.
+        But it could serve as a playground for new ideas or debugging, as no backward
+        implementation is needed.
+
+    .. warning::
+
+        This function requires the `nerfacc` package to be installed. Please install it
+        using the following command `pip install nerfacc`.
+
+    Args:
+        means2d: Gaussian means in 2D. [..., N, 2]
+        conics: Inverse of the 2D Gaussian covariance, Only upper triangle values. [..., N, 3]
+        opacities: Per-view Gaussian opacities (for example, when antialiasing is
+            enabled, Gaussian in each view would efficiently have different opacity). [..., N]
+        colors: Per-view Gaussian colors. Supports N-D features. [..., N, channels]
+        gaussian_ids: Collection of Gaussian indices to be rasterized. A flattened list of shape [M].
+        pixel_ids: Collection of pixel indices (row-major) to be rasterized. A flattened list of shape [M].
+        image_ids: Collection of image indices to be rasterized. A flattened list of shape [M].
+        image_width: Image width.
+        image_height: Image height.
+
+    Returns:
+        A tuple:
+
+        - **renders**: Accumulated colors. [..., image_height, image_width, channels]
+        - **alphas**: Accumulated opacities. [..., image_height, image_width, 1]
+    """
+
+    try:
+        from nerfacc import accumulate_along_rays, render_weight_from_alpha
+    except ImportError:
+        raise ImportError("Please install nerfacc package: pip install nerfacc")
+    image_dims = conics.shape[:-2]
+    I          = math.prod(image_dims)
+    N          = means3d.shape[-2]
+    channels   = colors.shape[-1]
+    assert conics.shape   == image_dims + (N, 3), conics.shape
+    assert opacities.shape== image_dims + (N,), opacities.shape
+    assert colors.shape   == image_dims + (N, channels), colors.shape
+
+    # Shape of the 2d ellipses
+    conics    = conics.reshape(I, N, 3)
+    # Opacities
+    opacities = opacities.reshape(I, N)
+    # Colors
+    colors    = colors.reshape(I, N, channels)
+
+    # From pixel_ids, deduce the pixel coordinates (in the image plane). Note that pixel_ids is a flattened list of shape [M], where M is the total number of intersections between pixels and Gaussians. Each pixel_id corresponds to a pixel in the image, and we can compute its 2D coordinates (x, y) using the image width and height.
+    pixel_ids_x  = pixel_ids % image_width
+    pixel_ids_y  = pixel_ids // image_width
+    pixel_coords = torch.stack([pixel_ids_x, pixel_ids_y], dim=-1) + 0.5  # [M, 2]
+    # 3D Rays from pixels
+    pixel_coords_h = torch.cat([pixel_coords, torch.ones_like(pixel_coords[..., :1])], dim=-1).unsqueeze(2)  # [M, 3]
+    # Compute the rays: for each pixel, we can compute the ray direction in the camera space by multiplying the inverse of the camera intrinsics (Kinv) with the homogeneous pixel coordinates, for the corresponding view. 
+    # TODO: generalize to several cameras, for the moment, we suppose all pixels are from the same camera, so we can directly multiply with Kinv. In the future, we can also support per-view Kinv, and then we need to index Kinv with image_ids.
+    rays = torch.matmul(Kinv, pixel_coords_h).squeeze(2)  #
+    # Normalize the rays to get the ray directions
+    rays = rays / torch.norm(rays, dim=-1, keepdim=True)
+    precisions = precisions[gaussian_ids]  # [M, 3, 3]
+    pminusmu = - means3d[gaussian_ids]  # p-mu in camera coordinates
+    pminusmu = pminusmu
+    # Compute all K0, K1, K2 in one go
+    K0 = torch.einsum('...i,...j,...ij->...', pminusmu, pminusmu, precisions)  # [M]
+    K2 = torch.einsum('...i,...j,...ij->...', rays, rays, precisions) # [M]
+    # Avoid K2 having too small values
+    #K2 = torch.clamp_min(K2, 1e-6)
+    K1 = torch.einsum('...i,...j,...ij->...', rays, pminusmu, precisions)  # [M]
+    exponent = (-K1**2/K2+K0)  # [M]
+    print('exponent', exponent.shape)
+    # Test if NaN values in exponent
+    if torch.isnan(exponent).any():
+        print('NaN values in exponent')
+        print('K0', K0)
+        print('K1', K1)
+        print('K2', K2)
+        raise ValueError('NaN values in exponent')
+
+    # Clamping the opacities to prevent numerical issues in the alpha compositing. 
+    # The maximum opacity is set to 0.999, which means each Gaussian can contribute at most 99.9% opacity to a pixel. 
+    # This is to prevent the accumulated opacity from reaching 1.0, which would cause numerical instability in the alpha compositing.
+    alphas = torch.clamp_max(
+        opacities[image_ids, gaussian_ids] * torch.exp(-exponent), 0.999
+    )
+    indices = image_ids * image_height * image_width + pixel_ids
+    total_pixels = I * image_height * image_width
     weights, trans = render_weight_from_alpha(
         alphas, ray_indices=indices, n_rays=total_pixels
     )
@@ -692,7 +823,6 @@ def _rasterize_to_pixels(
         )  # [M], [M], [M]
         if len(gs_ids) == 0:
             break
-
         # Accumulate the renderings within this batch of Gaussians.
         renders_step, accs_step = accumulate(
             means2d,
@@ -716,6 +846,108 @@ def _rasterize_to_pixels(
 
     return render_colors, render_alphas
 
+def _rasterize_to_pixels_int(
+    means2d: Tensor,    # [..., N, 2] (image ellipses centers)
+    means3d: Tensor,    # [..., N, 3] (3D centers in camera coordinates)
+    precisions: Tensor, # [..., N, 3, 3] (inverse of 3D covariances in camera coordinates)
+    conics:  Tensor,    # [..., N, 3] (image ellipses shapes)
+    Kinvs:   Tensor,    # [..., N, 3, 3] (inverse of intrinsic matrices)
+    colors:  Tensor,    # [..., N, channels] (colors)
+    opacities: Tensor,  # [..., N] (opacities)
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    batch_per_iter: int = 100,
+):
+    """Pytorch implementation of `gsplat.cuda._wrapper.rasterize_to_pixels()`.
+
+    This function rasterizes 2D Gaussians to pixels in a Pytorch-friendly way. It
+    iteratively accumulates the renderings within each batch of Gaussians. The
+    interations are controlled by `batch_per_iter`.
+    """
+    from ._wrapper import rasterize_to_indices_in_range
+
+    image_dims = means2d.shape[:-2]
+    channels = colors.shape[-1]
+    N = means2d.shape[-2]
+    tile_height = isect_offsets.shape[-2]
+    tile_width = isect_offsets.shape[-1]
+    assert means2d.shape == image_dims + (N, 2), means2d.shape
+    assert conics.shape == image_dims + (N, 3), conics.shape
+    assert colors.shape == image_dims + (N, channels), colors.shape
+    assert opacities.shape == image_dims + (N,), opacities.shape
+    assert isect_offsets.shape == image_dims + (
+        tile_height,
+        tile_width,
+    ), isect_offsets.shape
+    n_isects = len(flatten_ids)
+    # Reads the device from the input tensors
+    device = means2d.device
+
+    # The output render_colors and render_alphas are stored in float32 tensors.
+    render_colors = torch.zeros(
+        image_dims + (image_height, image_width, channels), device=device
+    )
+    render_alphas = torch.zeros(
+        image_dims + (image_height, image_width, 1), device=device
+    )
+
+    # Split Gaussians into batches and iteratively accumulate the renderings
+    block_size = tile_size * tile_size
+    isect_offsets_fl = torch.cat(
+        [isect_offsets.flatten(), torch.tensor([n_isects], device=device)]
+    )
+    max_range = (isect_offsets_fl[1:] - isect_offsets_fl[:-1]).max().item()
+    num_batches = (max_range + block_size - 1) // block_size
+    for step in range(0, num_batches, batch_per_iter):
+        transmittances = 1.0 - render_alphas[..., 0]
+
+        # Find the M intersections between pixels and gaussians.
+        # Each intersection corresponds to a tuple (gs_id, pixel_id, image_id)
+        # Does the job by smaller batches of Gaussians to save GPU memory (batch_per_iter)
+        gs_ids, pixel_ids, image_ids = rasterize_to_indices_in_range(
+            step,
+            step + batch_per_iter,
+            transmittances,
+            means2d,
+            conics,
+            opacities,
+            image_width,
+            image_height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )  # [M], [M], [M]
+        if len(gs_ids) == 0:
+            break
+        # Accumulate the renderings within this batch of Gaussians.
+        renders_step, accs_step = accumulate_int(
+            means2d,
+            means3d,
+            precisions,
+            conics,
+            Kinvs,
+            opacities,
+            colors,
+            gs_ids,
+            pixel_ids,
+            image_ids,
+            image_width,
+            image_height,
+        )
+        render_colors = render_colors + renders_step * transmittances[..., None]
+        render_alphas = render_alphas + accs_step    * transmittances[..., None]
+
+    render_alphas = render_alphas
+    if backgrounds is not None:
+        render_colors = render_colors + backgrounds[..., None, None, :] * (
+            1.0 - render_alphas
+        )
+
+    return render_colors, render_alphas
 
 def _eval_sh_bases_fast(basis_dim: int, dirs: Tensor):
     """

@@ -32,7 +32,7 @@ from utils import knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
 from gsplat.distributed import cli
-from gsplat.rendering import rasterization, _rasterization
+from gsplat.rendering import rasterization, _rasterization,  _rasterization_int
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -49,12 +49,13 @@ class Config:
     # Name of the sub-directory with the dataset
     subdir = "garden"
     subdir = "kitchen"
-    subdir = "bonsai"
     subdir = "stump"
     subdir = "alameda"
     subdir = "london"
     subdir = "london"
     subdir = "bicycle"
+    subdir = "bonsai"
+
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/"+subdir
     #data_dir: str = "datasets/data/zipnerf_undistorted/"+subdir
@@ -74,7 +75,7 @@ class Config:
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
     # Rasterization technique to use
-    rasterization_technique: Literal["CUDA", "GSPLAT", "OURS"] = "CUDA"
+    rasterization_technique: Literal["CUDA", "GSPLAT", "OURS"] = "GSPLAT"
 
     # Port for the viewer server
     port: int = 8080
@@ -175,7 +176,8 @@ def create_splats_with_optimizers(
     sh0_lr: float = 2.5e-3,
     shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
-    sh_degree: int = 3,
+    #sh_degree: int = 3,
+    sh_degree: int = 0,
     batch_size: int = 1,
     device: str = "cuda",
     world_rank: int = 0,
@@ -377,15 +379,20 @@ class Runner:
                     Ks=Ks,  # [C, 3, 3]
                     width=width,
                     height=height,
-                    #packed=self.cfg.packed,
-                    #absgrad=(
-                    #    self.cfg.strategy.absgrad
-                    #    if isinstance(self.cfg.strategy, DefaultStrategy)
-                    #    else False
-                    #),
                     rasterize_mode=rasterize_mode,
-                    #distributed=self.world_size > 1,
-                    #camera_model=self.cfg.camera_model,
+                    **kwargs)
+        if rasterization_technique=="OURS":
+            render_colors, render_alphas, info = _rasterization_int(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                    Ks=Ks,  # [C, 3, 3]
+                    width=width,
+                    height=height,
+                    rasterize_mode=rasterize_mode,
                     **kwargs)
         else:
             render_colors, render_alphas, info = rasterization(
@@ -811,6 +818,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
 
+    print(cfg.rasterization_technique)
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
     # If we pass a model checkpoint, load it and run eval only.

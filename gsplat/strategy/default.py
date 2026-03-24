@@ -217,6 +217,11 @@ class DefaultStrategy(Strategy):
         ]:
             assert key in info, f"{key} is required but missing."
 
+        print(f"Gradient for {self.key_for_gradient}: {info[self.key_for_gradient].grad}")
+
+
+
+
         # normalize grads to [-1, 1] screen space
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad.clone()

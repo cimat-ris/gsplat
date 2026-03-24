@@ -48,7 +48,8 @@ dataset_rename_map = {
 
 @dataclass
 class DownloadData:
-    dataset: dataset_names = "mipnerf360"
+    #dataset: dataset_names = "mipnerf360"
+    dataset: dataset_names = "zipnerf_undistorted"
     save_dir: Path = Path(os.getcwd() + "/data")
 
     def main(self):
