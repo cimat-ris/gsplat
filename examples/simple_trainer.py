@@ -122,7 +122,8 @@ class Config:
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
-        default_factory=DefaultStrategy
+        #default_factory=DefaultStrategy
+        default_factory=MCMCStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -157,10 +158,16 @@ class Config:
 
         # Strategy for densification
         strategy = self.strategy
-        strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-        strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-        strategy.reset_every = int(strategy.reset_every * factor)
-        strategy.refine_every = int(strategy.refine_every * factor)
+        #strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+        #strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+        #strategy.reset_every = int(strategy.reset_every * factor)
+        #strategy.refine_every = int(strategy.refine_every * factor)
+        strategy.cap_max = 200_000 # (int): Maximum number of GSs to cap at. Default to 1 million.
+        strategy.noise_lr = 5e5 # (float): MCMC samping noise learning rate. Default to 5e5.
+        strategy.refine_start_iter = 200 # (int): Start refining GSs after this iteration. Default to 500.
+        strategy.refine_stop_iter = 25_000 # (int): Stop refining GSs after this iteration. Default to 25_000.
+        strategy.refine_every = 10 # (int): Refine GSs every this steps. Default to 100.
+        strategy.min_opacity = 0.005 # (float): GSs with opacity below this value will be pruned. Default to 0.005.
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -327,7 +334,8 @@ class Runner:
         print("--- Rasterization technique: {}".format(self.cfg.rasterization_technique))
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
-        self.strategy_state = self.cfg.strategy.initialize_state(scene_scale=self.scene_scale)
+        #self.strategy_state = self.cfg.strategy.initialize_state(scene_scale=self.scene_scale)
+        self.strategy_state = self.cfg.strategy.initialize_state()
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -406,7 +414,7 @@ class Runner:
                     width=width,
                     height=height,
                     packed=self.cfg.packed,
-                    absgrad=self.cfg.strategy.absgrad,
+                    #absgrad=self.cfg.strategy.absgrad,
                     distributed=self.world_size > 1,
                     camera_model=self.cfg.camera_model,
                     **kwargs)
@@ -560,13 +568,14 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        lr=1e-3
+                        #packed=cfg.packed,
+                    )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -775,6 +784,7 @@ class Runner:
             / 255.0,
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
+            #rasterization_technique=cfg.rasterization_technique,
             camera_model=render_tab_state.camera_model,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
@@ -855,6 +865,8 @@ if __name__ == "__main__":
 
     """
     cfg = tyro.cli(Config)
-    cfg.strategy=DefaultStrategy(verbose=True)
+    #cfg.strategy=DefaultStrategy(verbose=True)
+    cfg.strategy= MCMCStrategy(verbose=True)
+
     cfg.adjust_steps(cfg.steps_scaler)
     cli(main, cfg, verbose=True)
