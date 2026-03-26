@@ -828,7 +828,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
 
-    print(cfg.rasterization_technique)
+    print("--- Rasterization:",cfg.rasterization_technique)
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
     # If we pass a model checkpoint, load it and run eval only.

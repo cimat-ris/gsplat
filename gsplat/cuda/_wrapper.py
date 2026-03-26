@@ -95,9 +95,9 @@ class FThetaCameraDistortionParameters:
 
 
 def world_to_cam(
-    means: Tensor,  # [..., N, 3]
-    covars: Tensor,  # [..., N, 3, 3]
-    viewmats: Tensor,  # [..., C, 4, 4]
+    means: Tensor,    # [..., N, 3]
+    covars: Tensor,   # [..., N, 3, 3]
+    viewmats: Tensor, # [..., C, 4, 4]
 ) -> Tuple[Tensor, Tensor]:
     """Transforms Gaussians from world to camera coordinate system.
 
@@ -130,7 +130,6 @@ def world_to_cam(
     covars = covars.contiguous()
     viewmats = viewmats.contiguous()
     return _world_to_cam(means, covars, viewmats)
-
 
 def adam(
     param: Tensor,

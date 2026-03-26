@@ -1138,22 +1138,14 @@ def _rasterization_int(
     )
 
     batch_dims = means.shape[:-2]
-    print("means.shape", means.shape)
-    print("batch_dims", batch_dims)
     num_batch_dims = len(batch_dims)
-    print("num_batch_dims", num_batch_dims)
     # Number of batches.
     B = math.prod(batch_dims)
-    print("B", B)
     # Number of Gaussians
     N = means.shape[-2]
-    print("N", N)
     # Number of Cameras
     C = viewmats.shape[-3]
-    print(viewmats)
-    print("C", C)
     I = B * C
-    print("I", I)
     device = means.device
     assert means.shape == batch_dims + (N, 3), means.shape
     assert quats.shape == batch_dims + (N, 4), quats.shape
@@ -1162,8 +1154,6 @@ def _rasterization_int(
     assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
-    print("colors.shape", colors.shape)
-    print(colors.dim())
     if sh_degree is None:
         # Treat colors as post-activation values, should be in shape [..., N, D] or [..., C, N, D]
         assert (
@@ -1188,13 +1178,9 @@ def _rasterization_int(
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
     # Project Gaussians to 2D.
     # The results are with shape [..., C, N, ...]. Only the elements with radii > 0 are valid.
-    # Min scale
-    print("Scale min", scales.min().item())
-    print("Scale max", scales.max().item())
+    # The outputs are expressed in the world frame.
     covars, precisions = _quat_scale_to_covar_preci(quats, scales, True, True, triu=False)
-    print("covars.shape", covars.shape)
-    print("precisions.shape", precisions.shape)
-    print("precisions max", precisions.max().item())
+
     # This function is fully fused and implemented in PyTorch, which is differentiable but might be slower than the original CUDA implementation. 
     # The outputs are with shape [..., C, N, ...], where only the elements with radii > 0 are valid.
     # The outputs include:
@@ -1221,13 +1207,8 @@ def _rasterization_int(
     for i in range(C):
         Kinvs[..., i, :, :] = torch.inverse(Ks[..., i, :, :])
 
-    # Descriptions of the Gaussians in the camera space.
-    means_c, covars_c = world_to_cam(means, covars, viewmats)
-
-
-    print("Kinvs.shape", Kinvs.shape)
-    print(radii.shape, means2d.shape, depths.shape, conics.shape)
-    print("opacities.shape", opacities.shape)
+    # Descriptions of the Gaussians in the camera space (means/covariance matrices).
+    means_c, precisions_c = world_to_cam(means, precisions, viewmats)
     opacities = torch.broadcast_to(
         opacities[..., None, :], batch_dims + (C, N)
     )  # [..., C, N]
@@ -1257,12 +1238,8 @@ def _rasterization_int(
         image_ids=image_ids,
         gaussian_ids=gaussian_ids,
     )
-    print("tiles_per_gauss.shape", tiles_per_gauss.shape)
-    print("isect_ids.shape", isect_ids.shape)
-    print("flatten_ids.shape", flatten_ids.shape)
     isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
     isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))
-    print("isect_offsets.shape", isect_offsets.shape)
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
         # Colors are post-activation values, with shape [..., N, D] or [..., C, N, D]
@@ -1313,7 +1290,7 @@ def _rasterization_int(
     # Render the colors and alphas, for each tile
     render_colors, render_alphas = _rasterize_to_pixels_int(
         means2d,
-        means,
+        means_c,
         precisions,
         conics,
         Kinvs,
@@ -1359,97 +1336,6 @@ def _rasterization_int(
         "n_cameras": C,
     }
     return render_colors, render_alphas, meta
-
-
-# def rasterization_legacy_wrapper(
-#     means: Tensor,  # [N, 3]
-#     quats: Tensor,  # [N, 4]
-#     scales: Tensor,  # [N, 3]
-#     opacities: Tensor,  # [N]
-#     colors: Tensor,  # [N, D] or [N, K, 3]
-#     viewmats: Tensor,  # [C, 4, 4]
-#     Ks: Tensor,  # [C, 3, 3]
-#     width: int,
-#     height: int,
-#     near_plane: float = 0.01,
-#     eps2d: float = 0.3,
-#     sh_degree: Optional[int] = None,
-#     tile_size: int = 16,
-#     backgrounds: Optional[Tensor] = None,
-#     **kwargs,
-# ) -> Tuple[Tensor, Tensor, Dict]:
-#     """Wrapper for old version gsplat.
-
-#     .. warning::
-#         This function exists for comparison purpose only. So we skip collecting
-#         the intermidiate variables, and only return an empty dict.
-
-#     """
-#     from gsplat.cuda_legacy._wrapper import (
-#         project_gaussians,
-#         rasterize_gaussians,
-#         spherical_harmonics,
-#     )
-
-#     assert eps2d == 0.3, "This is hard-coded in CUDA to be 0.3"
-#     C = len(viewmats)
-
-#     render_colors, render_alphas = [], []
-#     for cid in range(C):
-#         fx, fy = Ks[cid, 0, 0], Ks[cid, 1, 1]
-#         cx, cy = Ks[cid, 0, 2], Ks[cid, 1, 2]
-#         viewmat = viewmats[cid]
-
-#         means2d, depths, radii, conics, _, num_tiles_hit, _ = project_gaussians(
-#             means3d=means,
-#             scales=scales,
-#             glob_scale=1.0,
-#             quats=quats,
-#             viewmat=viewmat,
-#             fx=fx,
-#             fy=fy,
-#             cx=cx,
-#             cy=cy,
-#             img_height=height,
-#             img_width=width,
-#             block_width=tile_size,
-#             clip_thresh=near_plane,
-#         )
-
-#         if colors.dim() == 3:
-#             c2w = viewmat.inverse()
-#             viewdirs = means - c2w[:3, 3]
-#             # viewdirs = F.normalize(viewdirs, dim=-1).detach()
-#             if sh_degree is None:
-#                 sh_degree = int(math.sqrt(colors.shape[1]) - 1)
-#             colors = spherical_harmonics(sh_degree, viewdirs, colors)  # [N, 3]
-
-#         background = (
-#             backgrounds[cid]
-#             if backgrounds is not None
-#             else torch.zeros(colors.shape[-1], device=means.device)
-#         )
-
-#         render_colors_, render_alphas_ = rasterize_gaussians(
-#             xys=means2d,
-#             depths=depths,
-#             radii=radii,
-#             conics=conics,
-#             num_tiles_hit=num_tiles_hit,
-#             colors=colors,
-#             opacity=opacities[..., None],
-#             img_height=height,
-#             img_width=width,
-#             block_width=tile_size,
-#             background=background,
-#             return_alpha=True,
-#         )
-#         render_colors.append(render_colors_)
-#         render_alphas.append(render_alphas_[..., None])
-#     render_colors = torch.stack(render_colors, dim=0)
-#     render_alphas = torch.stack(render_alphas, dim=0)
-#     return render_colors, render_alphas, {}
-
 
 def rasterization_inria_wrapper(
     means: Tensor,  # [..., N, 3]

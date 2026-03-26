@@ -282,7 +282,6 @@ def _world_to_cam(
     )  # [..., C, N, 3, 3]
     return means_c, covars_c
 
-
 def _fully_fused_projection(
     means: Tensor,  # [..., N, 3]
     covars: Tensor,  # [..., N, 3, 3]
@@ -610,10 +609,8 @@ def accumulate(
 
 
 def accumulate_int(
-    means2d: Tensor,  # [..., N, 2]
     means3d: Tensor,  # [..., N, 3]
     precisions: Tensor,  # [..., N, 3, 3]
-    conics: Tensor,  # [..., N, 3]
     Kinv: Tensor, # [3, 3]
     opacities: Tensor,  # [..., N]
     colors: Tensor,  # [..., N, channels]
@@ -623,29 +620,12 @@ def accumulate_int(
     image_width: int,
     image_height: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Alpah compositing of 2D Gaussians in Pure Pytorch.
-
-    This function performs alpha compositing for Gaussians based on the pair of indices
-    {gaussian_ids, pixel_ids, image_ids}, which annotates the intersection between all
-    pixels and Gaussians. These intersections can be accquired from
-    `gsplat.rasterize_to_indices_in_range`.
-
-    .. note::
-
-        This function exposes the alpha compositing process into pure Pytorch.
-        So it relies on Pytorch's autograd for the backpropagation. It is much slower
-        than our fully fused rasterization implementation and comsumes much more GPU memory.
-        But it could serve as a playground for new ideas or debugging, as no backward
-        implementation is needed.
-
-    .. warning::
-
-        This function requires the `nerfacc` package to be installed. Please install it
-        using the following command `pip install nerfacc`.
+    """Alpha compositing of 3D Gaussians in Pure Pytorch.
 
     Args:
-        means2d: Gaussian means in 2D. [..., N, 2]
-        conics: Inverse of the 2D Gaussian covariance, Only upper triangle values. [..., N, 3]
+        means3d: Gaussian means in 3D in camera coordinates. [..., N, 3]
+        precisions: Inverse of the 3D Gaussian covariance. In camera coordinates. [..., N, 3, 3]
+        Kinv: Inverse of the camera intrinsics. [3, 3]
         opacities: Per-view Gaussian opacities (for example, when antialiasing is
             enabled, Gaussian in each view would efficiently have different opacity). [..., N]
         colors: Per-view Gaussian colors. Supports N-D features. [..., N, channels]
@@ -666,19 +646,11 @@ def accumulate_int(
         from nerfacc import accumulate_along_rays, render_weight_from_alpha
     except ImportError:
         raise ImportError("Please install nerfacc package: pip install nerfacc")
-    image_dims = conics.shape[:-2]
+    image_dims = opacities.shape[:-1]
     I          = math.prod(image_dims)
     N          = means3d.shape[-2]
     channels   = colors.shape[-1]
-    assert conics.shape   == image_dims + (N, 3), conics.shape
-    assert opacities.shape== image_dims + (N,), opacities.shape
-    assert colors.shape   == image_dims + (N, channels), colors.shape
-
-    # Shape of the 2d ellipses
-    conics    = conics.reshape(I, N, 3)
-    # Opacities
     opacities = opacities.reshape(I, N)
-    # Colors
     colors    = colors.reshape(I, N, channels)
 
     # From pixel_ids, deduce the pixel coordinates (in the image plane). Note that pixel_ids is a flattened list of shape [M], where M is the total number of intersections between pixels and Gaussians. Each pixel_id corresponds to a pixel in the image, and we can compute its 2D coordinates (x, y) using the image width and height.
@@ -692,9 +664,12 @@ def accumulate_int(
     rays = torch.matmul(Kinv, pixel_coords_h).squeeze(2)  #
     # Normalize the rays to get the ray directions
     rays = rays / torch.norm(rays, dim=-1, keepdim=True)
+    print('Gaussian ids', gaussian_ids.shape)
+    print("means3d shape:", means3d.shape)
+    print("gaussian_ids shape:", gaussian_ids.shape)
+    print("gaussian_ids min/max:", gaussian_ids.min().item(), gaussian_ids.max().item())
     precisions = precisions[gaussian_ids]  # [M, 3, 3]
-    pminusmu = - means3d[gaussian_ids]  # p-mu in camera coordinates
-    pminusmu = pminusmu
+    pminusmu = - means3d[0][gaussian_ids]  # p-mu in camera coordinates
     # Compute all K0, K1, K2 in one go
     K0 = torch.einsum('...i,...j,...ij->...', pminusmu, pminusmu, precisions)  # [M]
     K2 = torch.einsum('...i,...j,...ij->...', rays, rays, precisions) # [M]
@@ -702,7 +677,6 @@ def accumulate_int(
     #K2 = torch.clamp_min(K2, 1e-6)
     K1 = torch.einsum('...i,...j,...ij->...', rays, pminusmu, precisions)  # [M]
     exponent = (-K1**2/K2+K0)  # [M]
-    print('exponent', exponent.shape)
     # Test if NaN values in exponent
     if torch.isnan(exponent).any():
         print('NaN values in exponent')
@@ -925,10 +899,8 @@ def _rasterize_to_pixels_int(
             break
         # Accumulate the renderings within this batch of Gaussians.
         renders_step, accs_step = accumulate_int(
-            means2d,
             means3d,
             precisions,
-            conics,
             Kinvs,
             opacities,
             colors,
