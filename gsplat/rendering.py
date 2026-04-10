@@ -1113,7 +1113,6 @@ def _rasterization_int(
     eps2d: float = 0.3,
     sh_degree: Optional[int] = None,
     tile_size: int = 16,
-    backgrounds: Optional[Tensor] = None,
     render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
@@ -1273,18 +1272,8 @@ def _rasterization_int(
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
-        if backgrounds is not None:
-            backgrounds = torch.cat(
-                [
-                    backgrounds,
-                    torch.zeros(batch_dims + (C, 1), device=backgrounds.device),
-                ],
-                dim=-1,
-            )
     elif render_mode in ["D", "ED"]:
         colors = depths[..., None]
-        if backgrounds is not None:
-            backgrounds = torch.zeros(batch_dims + (C, 1), device=backgrounds.device)
     else:  # RGB
         pass
     # Render the colors and alphas, for each tile
@@ -1301,7 +1290,6 @@ def _rasterization_int(
         tile_size,
         isect_offsets,
         flatten_ids,
-        backgrounds=backgrounds,
         batch_per_iter=batch_per_iter,
     )
     if render_mode in ["ED", "RGB+ED"]:

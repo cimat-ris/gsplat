@@ -626,9 +626,8 @@ def accumulate_int(
         means3d: Gaussian means in 3D in camera coordinates. [..., N, 3]
         precisions: Inverse of the 3D Gaussian covariance. In camera coordinates. [..., N, 3, 3]
         Kinv: Inverse of the camera intrinsics. [3, 3]
-        opacities: Per-view Gaussian opacities (for example, when antialiasing is
-            enabled, Gaussian in each view would efficiently have different opacity). [..., N]
-        colors: Per-view Gaussian colors. Supports N-D features. [..., N, channels]
+        opacities: Per-view Gaussian opacities. [..., N]
+        colors: Per-view Gaussian colors. [..., N, channels]
         gaussian_ids: Collection of Gaussian indices to be rasterized. A flattened list of shape [M].
         pixel_ids: Collection of pixel indices (row-major) to be rasterized. A flattened list of shape [M].
         image_ids: Collection of image indices to be rasterized. A flattened list of shape [M].
@@ -637,7 +636,6 @@ def accumulate_int(
 
     Returns:
         A tuple:
-
         - **renders**: Accumulated colors. [..., image_height, image_width, channels]
         - **alphas**: Accumulated opacities. [..., image_height, image_width, 1]
     """
@@ -664,10 +662,7 @@ def accumulate_int(
     rays = torch.matmul(Kinv, pixel_coords_h).squeeze(2)  #
     # Normalize the rays to get the ray directions
     rays = rays / torch.norm(rays, dim=-1, keepdim=True)
-    print('Gaussian ids', gaussian_ids.shape)
-    print("means3d shape:", means3d.shape)
-    print("gaussian_ids shape:", gaussian_ids.shape)
-    print("gaussian_ids min/max:", gaussian_ids.min().item(), gaussian_ids.max().item())
+
     precisions = precisions[gaussian_ids]  # [M, 3, 3]
     pminusmu = - means3d[0][gaussian_ids]  # p-mu in camera coordinates
     # Compute all K0, K1, K2 in one go
@@ -897,6 +892,20 @@ def _rasterize_to_pixels_int(
         )  # [M], [M], [M]
         if len(gs_ids) == 0:
             break
+
+        test_pixel_id = 100*image_width + 100
+        if (pixel_ids == test_pixel_id).any():
+            print(means3d.shape,means2d.shape)
+            print('Found intersection with pixel_id 10000')
+            idx = pixel_ids[pixel_ids == test_pixel_id]
+            print(idx.shape)
+            idx = idx[0]
+            print('gs_id:', gs_ids[idx].item())
+            print('image_id:', image_ids[idx].item())
+            print('mean3d:', means3d[image_ids[idx], gs_ids[idx]].tolist())
+            print('mean2d:', means2d[image_ids[idx], gs_ids[idx]].tolist())
+            print('conic:', conics[image_ids[idx], gs_ids[idx]].tolist())
+            print('opacity:', opacities[image_ids[idx], gs_ids[idx]].item())
         # Accumulate the renderings within this batch of Gaussians.
         renders_step, accs_step = accumulate_int(
             means3d,

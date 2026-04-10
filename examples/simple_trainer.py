@@ -162,7 +162,7 @@ class Config:
         #strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
         #strategy.reset_every = int(strategy.reset_every * factor)
         #strategy.refine_every = int(strategy.refine_every * factor)
-        strategy.cap_max = 200_000 # (int): Maximum number of GSs to cap at. Default to 1 million.
+        strategy.cap_max = 600_000 # (int): Maximum number of GSs to cap at. Default to 1 million.
         strategy.noise_lr = 5e5 # (float): MCMC samping noise learning rate. Default to 5e5.
         strategy.refine_start_iter = 200 # (int): Start refining GSs after this iteration. Default to 500.
         strategy.refine_stop_iter = 25_000 # (int): Stop refining GSs after this iteration. Default to 25_000.
